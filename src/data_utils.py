@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import shutil
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -7,6 +8,7 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+CLASS_TO_ID = {"Glioma": 0, "Meningioma": 1, "No Tumor": 2, "Pituitary": 3}
 
 
 def read_boxes(lbl_path):
@@ -34,14 +36,21 @@ def box_is_valid(b, eps=1e-6):
 
 def scan_dataset(root="data"):
     """One row per image (df) and one row per box (df_boxes)."""
+    root_dir = Path(root)
+    root_path = root_dir.resolve()
     rows, boxes = [], []
-    for img in Path(root).rglob("*"):
+    for img in root_dir.rglob("*"):
         if img.suffix.lower() not in IMG_EXTS or img.parent.name != "images":
             continue
         cls_dir = img.parent.parent
         lbl = cls_dir / "labels" / f"{img.stem}.txt"
+        source_split = cls_dir.parent.name
+        # Ignore any output folders created by clean_and_split on later notebook runs.
+        if (source_split not in {"Train", "Val"}
+                or cls_dir.parent.parent.resolve() != root_path):
+            continue
         row = {"path": str(img), "label": cls_dir.name,
-               "folder": cls_dir.parent.name, "has_label": lbl.exists()}
+               "folder": source_split, "has_label": lbl.exists()}
         try:
             with Image.open(img) as im:
                 im.verify()
@@ -53,12 +62,16 @@ def scan_dataset(root="data"):
             row["corrupted"] = True
 
         bs, n_malformed = read_boxes(lbl)
+        n_bad_geometry = sum(not box_is_valid(b) for b in bs)
+        n_class_mismatch = sum(c != CLASS_TO_ID.get(cls_dir.name) for c, *_ in bs)
         row["n_boxes"] = len(bs)
-        row["n_bad_boxes"] = n_malformed + sum(not box_is_valid(b) for b in bs)
+        row["n_class_mismatch"] = n_class_mismatch
+        row["n_bad_boxes"] = n_malformed + n_bad_geometry + n_class_mismatch
         rows.append(row)
         for c, xc, yc, w, h in bs:
             boxes.append({"path": str(img), "label": cls_dir.name,
-                          "class_id": c, "xc": xc, "yc": yc, "w": w, "h": h})
+                          "class_id": c, "class_matches_folder": c == CLASS_TO_ID.get(cls_dir.name),
+                          "xc": xc, "yc": yc, "w": w, "h": h})
     return pd.DataFrame(rows), pd.DataFrame(boxes)
 
 
@@ -82,14 +95,41 @@ def show_samples(df, df_boxes, n=4, seed=42):
     plt.show()
 
 
-def clean_and_split(df, seed=42):
-    d = df[~df.corrupted]                                   # corrupted files
-    d = d[d.n_bad_boxes == 0]                               # inconsistent annotations
-    conflicts = d.groupby("md5")["label"].nunique()
-    d = d[~d.md5.isin(conflicts[conflicts > 1].index)]      # same image, different labels
-    d = d.drop_duplicates("md5")                            # duplicates (also across train/val)
+def clean_and_split(df, output_root="../data/split", seed=42, test_size=0.20):
+    """Split original Train into folders; preserve original Val unchanged."""
+    d = df[(df.folder == "Train") & (~df.corrupted) & (df.n_bad_boxes == 0) & df.has_label].copy()
 
-    train, temp = train_test_split(d, test_size=0.30, stratify=d.label, random_state=seed)
-    val, test = train_test_split(temp, test_size=0.50, stratify=temp.label, random_state=seed)
-    out = pd.concat([train.assign(split="train"), val.assign(split="val"), test.assign(split="test")])
+    # Keep identical images out of the new split if their copy is already in Val.
+    val_hashes = set(df.loc[(df.folder == "Val") & (~df.corrupted), "md5"].dropna())
+    d = d[~d.md5.isin(val_hashes)]
+
+    # Exclude conflicting labels and retain one copy of each identical Train image.
+    conflicts = d.groupby("md5")["label"].nunique()
+    d = d[~d.md5.isin(conflicts[conflicts > 1].index)]
+    d = d.drop_duplicates("md5")
+
+    train, test = train_test_split(
+        d, test_size=test_size, stratify=d.label, random_state=seed
+    )
+    out = pd.concat([train.assign(split="Train"), test.assign(split="Test")])
+
+    output_root = Path(output_root)
+    for split in ("Train", "Test"):
+        for class_name in CLASS_TO_ID:
+            for kind in ("images", "labels"):
+                folder = output_root / split / class_name / kind
+                folder.mkdir(parents=True, exist_ok=True)
+                for old_file in folder.iterdir():
+                    if old_file.is_file():
+                        old_file.unlink()
+
+    for row in out.itertuples(index=False):
+        image_path = Path(row.path)
+        image_out = output_root / row.split / row.label / "images" / image_path.name
+        shutil.copy2(image_path, image_out)
+        label_path = image_path.parent.parent / "labels" / f"{image_path.stem}.txt"
+        if label_path.exists():
+            label_out = output_root / row.split / row.label / "labels" / label_path.name
+            shutil.copy2(label_path, label_out)
+
     return out[["path", "label", "md5", "n_boxes", "split"]].reset_index(drop=True)
